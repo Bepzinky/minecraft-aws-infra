@@ -7,3 +7,6 @@
 
 #Keys
 *.pem
+
+.env
+ansible/inventory.ini
