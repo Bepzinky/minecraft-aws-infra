@@ -34,6 +34,18 @@
       args:
         creates: /usr/local/bin/aws
 
+    - name: Install pip
+      yum:
+        name: python3-pip
+        state: present
+
+    - name: Install compatible requests and urllib3 for Python 3.7
+      pip:
+        name:
+          - "urllib3<2.0"
+          - "requests"
+        executable: pip3
+
     - name: Authenticate Docker to ECR
       shell: |
         aws ecr get-login-password --region {{ aws_region }} | \
