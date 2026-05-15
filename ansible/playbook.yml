@@ -1,0 +1,85 @@
+---
+- name: Configure Minecraft server
+  hosts: all
+  become: true
+  vars:
+    aws_region: "us-east-1"
+    data_dir: /opt/minecraft/data
+    minecraft_image_tag: "latest"
+
+  tasks:
+
+    - name: Install Docker
+      yum:
+        name: docker
+        state: present
+
+    - name: Start and enable Docker
+      service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Add ec2-user to docker group
+      user:
+        name: ec2-user
+        groups: docker
+        append: true
+
+    - name: Install AWS CLI v2
+      shell: |
+        curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+        unzip -q /tmp/awscliv2.zip -d /tmp
+        /tmp/aws/install --update
+      args:
+        creates: /usr/local/bin/aws
+
+    - name: Authenticate Docker to ECR
+      shell: |
+        aws ecr get-login-password --region {{ aws_region }} | \
+        docker login --username AWS --password-stdin \
+          {{ ecr_repo_url | regex_replace('/[^/]+$', '') }}
+      changed_when: false
+
+    - name: Create world data directory
+      file:
+        path: "{{ data_dir }}"
+        state: directory
+        owner: ec2-user
+        mode: '0755'
+
+    - name: Restore world data from S3
+      shell: |
+        aws s3 sync s3://{{ s3_bucket }}/world/ {{ data_dir }}/ --no-progress
+      changed_when: false
+
+    - name: Pull Minecraft image from ECR
+      community.docker.docker_image:
+        name: "{{ ecr_repo_url }}:{{ minecraft_image_tag }}"
+        source: pull
+        force_source: true
+
+    - name: Remove existing Minecraft container if present
+      community.docker.docker_container:
+        name: minecraft
+        state: absent
+
+    - name: Start Minecraft container
+      community.docker.docker_container:
+        name: minecraft
+        image: "{{ ecr_repo_url }}:{{ minecraft_image_tag }}"
+        state: started
+        restart_policy: unless-stopped
+        ports:
+          - "25565:25565"
+        volumes:
+          - "{{ data_dir }}:/data"
+        env:
+          EULA: "TRUE"
+          MEMORY: "2G"
+
+    - name: Schedule S3 world backup every 30 minutes
+      cron:
+        name: minecraft-backup
+        minute: "*/30"
+        job: "aws s3 sync {{ data_dir }}/ s3://{{ s3_bucket }}/world/ --no-progress"

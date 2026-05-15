@@ -1,0 +1,63 @@
+name: Publish Minecraft image
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPO: mc-server-3
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Pull, tag, and push image to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG:    ${{ github.ref_name }}
+        run: |
+          docker pull itzg/mc-server3:latest
+          docker tag  itzg/mc-server-3:latest $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG
+          docker tag  itzg/mc-server-3:latest $ECR_REGISTRY/$ECR_REPO:latest
+          docker push $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPO:latest
+
+      - name: Smoke test — verify server initializes
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG:    ${{ github.ref_name }}
+        run: |
+          docker run -d --name mc-smoke \
+            -e EULA=TRUE \
+            -p 25565:25565 \
+            $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG
+
+          SUCCESS=0
+          for i in $(seq 1 12); do
+            sleep 10
+            docker logs mc-smoke 2>&1 | grep -q "Done" && SUCCESS=1 && break
+            echo "Attempt $i/12 — waiting for server..."
+          done
+
+          docker logs mc-smoke
+          docker rm -f mc-smoke
+
+          [ $SUCCESS -eq 1 ] && echo "Smoke test passed" || { echo "Smoke test FAILED"; exit 1; }
