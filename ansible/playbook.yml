@@ -57,13 +57,23 @@
       file:
         path: "{{ data_dir }}"
         state: directory
-        owner: ec2-user
+        owner: "1000"
+        group: "1000"
         mode: '0755'
 
     - name: Restore world data from S3
       shell: |
         aws s3 sync s3://{{ s3_bucket }}/world/ {{ data_dir }}/ --no-progress
       changed_when: false
+
+    - name: Fix permissions
+      file:
+        path: "{{ data_dir }}"
+        state: directory
+        owner: "1000"
+        group: "1000"
+        mode: '0755'
+        recurse: true
 
     - name: Pull Minecraft image from ECR
       community.docker.docker_image:
