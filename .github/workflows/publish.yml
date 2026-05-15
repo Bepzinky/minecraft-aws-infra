@@ -34,7 +34,7 @@ jobs:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG:    ${{ github.ref_name }}
         run: |
-          docker pull itzg/mc-server3:latest
+          docker pull itzg/mc-server-3:latest
           docker tag  itzg/mc-server-3:latest $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG
           docker tag  itzg/mc-server-3:latest $ECR_REGISTRY/$ECR_REPO:latest
           docker push $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG
