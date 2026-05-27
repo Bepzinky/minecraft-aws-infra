@@ -51,7 +51,7 @@ resource "aws_instance" "minecraft" {
   iam_instance_profile        = "LabInstanceProfile"
 
   root_block_device {
-    volume_size = 20
+    volume_size = 30
     volume_type = "gp3"
   }
 

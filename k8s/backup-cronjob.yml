@@ -1,0 +1,27 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: minecraft-backup
+  namespace: minecraft
+spec:
+  schedule: "*/30 * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              image: amazon/aws-cli:latest
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  aws s3 sync /data/ s3://mc-backups-od3/world/ --no-progress
+              volumeMounts:
+                - name: world-data
+                  mountPath: /data
+          volumes:
+            - name: world-data
+              persistentVolumeClaim:
+                claimName: minecraft-data

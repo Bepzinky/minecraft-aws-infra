@@ -1,32 +1,23 @@
 ---
-- name: Configure Minecraft server
+- name: Bootstrap k3s
   hosts: all
   become: true
   vars:
     aws_region: "us-east-1"
-    data_dir: /opt/minecraft/data
-    minecraft_image_tag: "latest"
+    data_dir: "/opt/minecraft/data"
 
   tasks:
 
-    - name: Install Docker
+    - name: Install required packages
       yum:
-        name: docker
+        name:
+          - docker
+          - python3-pip
+          - curl
+          - unzip
         state: present
 
-    - name: Start and enable Docker
-      service:
-        name: docker
-        state: started
-        enabled: true
-
-    - name: Add ec2-user to docker group
-      user:
-        name: ec2-user
-        groups: docker
-        append: true
-
-    - name: Install AWS CLI v2
+    - name: Install AWS CLI
       shell: |
         curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
         unzip -q /tmp/awscliv2.zip -d /tmp
@@ -34,23 +25,79 @@
       args:
         creates: /usr/local/bin/aws
 
-    - name: Install pip
-      yum:
-        name: python3-pip
-        state: present
-
-    - name: Install compatible requests and urllib3 for Python 3.7
+    - name: Install compatible urllib3 and requests
       pip:
         name:
           - "urllib3<2.0"
           - "requests"
         executable: pip3
 
-    - name: Authenticate Docker to ECR
+    - name: Install k3s
       shell: |
-        aws ecr get-login-password --region {{ aws_region }} | \
-        docker login --username AWS --password-stdin \
-          {{ ecr_repo_url | regex_replace('/[^/]+$', '') }}
+        curl -sfL https://get.k3s.io | sh -
+      args:
+        creates: /usr/local/bin/k3s
+
+    - name: Wait for k3s
+      shell: k3s kubectl get nodes
+      register: k3s_ready
+      retries: 15
+      delay: 10
+      until: k3s_ready.rc == 0
+      changed_when: false
+
+    - name: Create credential provider bin directory
+      file:
+        path: /usr/local/bin
+        state: directory
+        mode: '0755'
+
+    - name: Download ECR binary
+      get_url:
+        url: "https://github.com/kubernetes/cloud-provider-aws/releases/download/v1.27.1/ecr-credential-provider-linux-amd64"
+        dest: /usr/local/bin/ecr-credential-provider
+        mode: '0755'
+
+    - name: Create k3s config directory
+      file:
+        path: /etc/rancher/k3s
+        state: directory
+        mode: '0755'
+
+    - name: Write credential provider config
+      copy:
+        dest: /etc/rancher/k3s/credential-provider-config.yaml
+        mode: '0644'
+        content: |
+          apiVersion: kubelet.config.k8s.io/v1
+          kind: CredentialProviderConfig
+          providers:
+            - name: ecr-credential-provider
+              matchImages:
+                - "*.dkr.ecr.*.amazonaws.com"
+              defaultCacheDuration: "12h"
+              apiVersion: credentialproviders.kubelet.k8s.io/v1
+
+    - name: Write k3s config
+      copy:
+        dest: /etc/rancher/k3s/config.yaml
+        mode: '0644'
+        content: |
+          kubelet-arg:
+            - "image-credential-provider-config=/etc/rancher/k3s/credential-provider-config.yaml"
+            - "image-credential-provider-bin-dir=/usr/local/bin"
+
+    - name: Restart k3s
+      service:
+        name: k3s
+        state: restarted
+
+    - name: Wait for k3s
+      shell: k3s kubectl get nodes
+      register: k3s_ready2
+      retries: 15
+      delay: 10
+      until: k3s_ready2.rc == 0
       changed_when: false
 
     - name: Create world data directory
@@ -61,12 +108,12 @@
         group: "1000"
         mode: '0755'
 
-    - name: Restore world data from S3
+    - name: Restore world data
       shell: |
         aws s3 sync s3://{{ s3_bucket }}/world/ {{ data_dir }}/ --no-progress
       changed_when: false
 
-    - name: Fix permissions
+    - name: Fix permissions after restore
       file:
         path: "{{ data_dir }}"
         state: directory
@@ -75,33 +122,38 @@
         mode: '0755'
         recurse: true
 
-    - name: Pull Minecraft image from ECR
-      community.docker.docker_image:
-        name: "{{ ecr_repo_url }}:{{ minecraft_image_tag }}"
-        source: pull
-        force_source: true
+    - name: Copy k8s manifests
+      copy:
+        src: "../k8s/"
+        dest: /opt/minecraft/k8s/
+        mode: '0644'
 
-    - name: Remove existing Minecraft container if present
-      community.docker.docker_container:
-        name: minecraft
-        state: absent
+    - name: Apply namespace
+      shell: k3s kubectl apply -f /opt/minecraft/k8s/namespace.yml
+      changed_when: false
 
-    - name: Start Minecraft container
-      community.docker.docker_container:
-        name: minecraft
-        image: "{{ ecr_repo_url }}:{{ minecraft_image_tag }}"
-        state: started
-        restart_policy: unless-stopped
-        ports:
-          - "25565:25565"
-        volumes:
-          - "{{ data_dir }}:/data"
-        env:
-          EULA: "TRUE"
-          MEMORY: "2G"
+    - name: Apply ConfigMap
+      shell: k3s kubectl apply -f /opt/minecraft/k8s/configmap.yml
+      changed_when: false
 
-    - name: Schedule S3 world backup every 30 minutes
-      cron:
-        name: minecraft-backup
-        minute: "*/30"
-        job: "aws s3 sync {{ data_dir }}/ s3://{{ s3_bucket }}/world/ --no-progress"
+    - name: Apply PVC
+      shell: k3s kubectl apply -f /opt/minecraft/k8s/pvc.yml
+      changed_when: false
+
+    - name: Apply Deployment
+      shell: k3s kubectl apply -f /opt/minecraft/k8s/deployment.yml
+      changed_when: false
+
+    - name: Apply Service
+      shell: k3s kubectl apply -f /opt/minecraft/k8s/service.yml
+      changed_when: false
+
+    - name: Apply backup CronJob
+      shell: k3s kubectl apply -f /opt/minecraft/k8s/backup-cronjob.yml
+      changed_when: false
+
+    - name: Wait for Minecraft deployment to be available
+      shell: |
+        k3s kubectl wait --for=condition=available \
+          deployment/minecraft -n minecraft --timeout=300s
+      changed_when: false
