@@ -32,9 +32,9 @@
           - "requests"
         executable: pip3
 
-    - name: Install k3s
+    - name: Install k3s (skip SELinux on Amazon Linux 2)
       shell: |
-        curl -sfL https://get.k3s.io | sh -
+        curl -sfL https://get.k3s.io | INSTALL_K3S_SKIP_SELINUX_RPM=true sh -
       args:
         creates: /usr/local/bin/k3s
 
