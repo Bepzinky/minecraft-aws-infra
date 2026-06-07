@@ -1,0 +1,58 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: cs312-alerts
+  namespace: monitoring
+  labels:
+    release: monitoring
+spec:
+  groups:
+    - name: cs312.rules
+      rules:
+
+        - alert: PodCrashLooping
+          expr: increase(kube_pod_container_status_restarts_total{namespace="minecraft"}[5m]) > 3
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Pod {{ $labels.pod }} is crash looping"
+            runbook: |
+              1. kubectl describe pod {{ $labels.pod }} -n {{ $labels.namespace }}
+              2. kubectl logs {{ $labels.pod }} -n {{ $labels.namespace }} --previous
+              3. Check image tag exists in ECR
+              4. kubectl rollout undo deployment/minecraft -n minecraft
+              5. kubectl get pods -n minecraft
+
+        - alert: MinecraftServiceDown
+          expr: |
+            kube_pod_status_ready{
+              namespace="minecraft",
+              condition="true",
+              pod=~"minecraft-[^b].*"
+            } == 0
+          for: 3m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Minecraft pod not ready — players cannot connect"
+            runbook: |
+              1. kubectl get pods -n minecraft
+              2. kubectl describe pod -n minecraft -l app=minecraft
+              3. kubectl logs -n minecraft deployment/minecraft --previous
+              4. kubectl get svc -n minecraft
+              5. kubectl rollout restart deployment/minecraft -n minecraft
+
+        - alert: MinecraftHighMemory
+          expr: |
+            container_memory_working_set_bytes{namespace="minecraft", container="minecraft"}
+            / (5 * 1024 * 1024 * 1024) * 100 > 85
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Minecraft memory above 85% of 5Gi limit"
+            runbook: |
+              1. kubectl top pods -n minecraft
+              2. kubectl logs -n minecraft deployment/minecraft | grep -i "memory\|heap\|gc"
+              3. kubectl rollout restart deployment/minecraft -n minecraft

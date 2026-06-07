@@ -1,5 +1,5 @@
 ---
-- name: Bootstrap k3s
+- name: Bootstrap k3s Minecraft node
   hosts: all
   become: true
   vars:
@@ -32,72 +32,92 @@
           - "requests"
         executable: pip3
 
-    - name: Install k3s (skip SELinux on Amazon Linux 2)
+    - name: Uninstall any broken k3s installation
       shell: |
-        curl -sfL https://get.k3s.io | INSTALL_K3S_SKIP_SELINUX_RPM=true sh -
-      args:
-        creates: /usr/local/bin/k3s
+        if [ -f /usr/local/bin/k3s-uninstall.sh ] && [ ! -f /etc/systemd/system/k3s.service ]; then
+          /usr/local/bin/k3s-uninstall.sh
+        fi
+      changed_when: false
 
-    - name: Wait for k3s
-      shell: k3s kubectl get nodes
+    - name: Install k3s pinned version v1.28.8
+      shell: |
+        curl -sfL https://get.k3s.io | \
+          INSTALL_K3S_SKIP_SELINUX_RPM=true \
+          INSTALL_K3S_VERSION="v1.28.8+k3s1" \
+          sh -
+      args:
+        creates: /etc/systemd/system/k3s.service
+
+    - name: Enable and start k3s service
+      systemd:
+        name: k3s
+        state: started
+        enabled: true
+        daemon_reload: true
+
+    - name: Wait for k3s API to be ready
+      shell: /usr/local/bin/k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get nodes
       register: k3s_ready
-      retries: 15
+      retries: 30
       delay: 10
       until: k3s_ready.rc == 0
       changed_when: false
 
-    - name: Create credential provider bin directory
-      file:
-        path: /usr/local/bin
-        state: directory
-        mode: '0755'
-
-    - name: Download ECR binary
-      get_url:
-        url: "https://github.com/kubernetes/cloud-provider-aws/releases/download/v1.27.1/ecr-credential-provider-linux-amd64"
-        dest: /usr/local/bin/ecr-credential-provider
-        mode: '0755'
-
-    - name: Create k3s config directory
-      file:
-        path: /etc/rancher/k3s
-        state: directory
-        mode: '0755'
-
-    - name: Write credential provider config
-      copy:
-        dest: /etc/rancher/k3s/credential-provider-config.yaml
-        mode: '0644'
-        content: |
-          apiVersion: kubelet.config.k8s.io/v1
-          kind: CredentialProviderConfig
-          providers:
-            - name: ecr-credential-provider
-              matchImages:
-                - "*.dkr.ecr.*.amazonaws.com"
-              defaultCacheDuration: "12h"
-              apiVersion: credentialproviders.kubelet.k8s.io/v1
-
-    - name: Write k3s config
-      copy:
-        dest: /etc/rancher/k3s/config.yaml
-        mode: '0644'
-        content: |
-          kubelet-arg:
-            - "image-credential-provider-config=/etc/rancher/k3s/credential-provider-config.yaml"
-            - "image-credential-provider-bin-dir=/usr/local/bin"
-
-    - name: Restart k3s
-      service:
-        name: k3s
-        state: restarted
-
-    - name: Wait for k3s
-      shell: k3s kubectl get nodes
-      register: k3s_ready2
-      retries: 15
+    - name: Wait for k3s API to fully initialize namespaces
+      shell: /usr/local/bin/k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get namespaces
+      register: k3s_ns_ready
+      retries: 30
       delay: 10
-      until: k3s_ready2.rc == 0
+      until: k3s_ns_ready.rc == 0
+      changed_when: false
+
+    - name: Pause for API server to stabilize
+      pause:
+        seconds: 30
+
+    - name: Get ECR login token
+      shell: aws ecr get-login-password --region {{ aws_region }}
+      register: ecr_token
+      changed_when: false
+
+    - name: Get ECR registry hostname
+      shell: echo "{{ ecr_repo_url }}" | cut -d'/' -f1
+      register: ecr_registry
+      changed_when: false
+
+    - name: Wait for k3s API to fully stabilize
+      shell: |
+        for i in $(seq 1 10); do
+          /usr/local/bin/k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get namespaces && \
+          /usr/local/bin/k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get pods -A && \
+          echo "API stable" && exit 0
+          sleep 10
+        done
+        exit 1
+      register: api_stable
+      retries: 10
+      delay: 10
+      until: api_stable.rc == 0
+      changed_when: false
+
+    - name: Create minecraft namespace
+      shell: |
+        /usr/local/bin/k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml \
+          get namespace minecraft || \
+        /usr/local/bin/k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml \
+          create namespace minecraft
+      changed_when: false
+
+    - name: Create ECR imagePullSecret
+      shell: |
+        /usr/local/bin/k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml \
+          delete secret ecr-secret -n minecraft --ignore-not-found
+        /usr/local/bin/k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml \
+          create secret docker-registry ecr-secret \
+          --docker-server={{ ecr_registry.stdout }} \
+          --docker-username=AWS \
+          --docker-password={{ ecr_token.stdout }} \
+          --namespace=minecraft
       changed_when: false
 
     - name: Create world data directory
@@ -108,7 +128,7 @@
         group: "1000"
         mode: '0755'
 
-    - name: Restore world data
+    - name: Restore world data from S3
       shell: |
         aws s3 sync s3://{{ s3_bucket }}/world/ {{ data_dir }}/ --no-progress
       changed_when: false
@@ -122,38 +142,39 @@
         mode: '0755'
         recurse: true
 
-    - name: Copy k8s manifests
+    - name: Copy k8s manifests to host
       copy:
         src: "../k8s/"
         dest: /opt/minecraft/k8s/
         mode: '0644'
 
     - name: Apply namespace
-      shell: k3s kubectl apply -f /opt/minecraft/k8s/namespace.yml
+      shell: /usr/local/bin/k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply --validate=false -f /opt/minecraft/k8s/namespace.yml
       changed_when: false
 
     - name: Apply ConfigMap
-      shell: k3s kubectl apply -f /opt/minecraft/k8s/configmap.yml
+      shell: /usr/local/bin/k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply --validate=false -f /opt/minecraft/k8s/configmap.yml
       changed_when: false
 
     - name: Apply PVC
-      shell: k3s kubectl apply -f /opt/minecraft/k8s/pvc.yml
+      shell: /usr/local/bin/k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply --validate=false -f /opt/minecraft/k8s/pvc.yml
       changed_when: false
 
     - name: Apply Deployment
-      shell: k3s kubectl apply -f /opt/minecraft/k8s/deployment.yml
+      shell: /usr/local/bin/k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply --validate=false -f /opt/minecraft/k8s/deployment.yml
       changed_when: false
 
     - name: Apply Service
-      shell: k3s kubectl apply -f /opt/minecraft/k8s/service.yml
+      shell: /usr/local/bin/k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply --validate=false -f /opt/minecraft/k8s/service.yml
       changed_when: false
 
     - name: Apply backup CronJob
-      shell: k3s kubectl apply -f /opt/minecraft/k8s/backup-cronjob.yml
+      shell: /usr/local/bin/k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply --validate=false -f /opt/minecraft/k8s/backup-cronjob.yml
       changed_when: false
 
     - name: Wait for Minecraft deployment to be available
       shell: |
-        k3s kubectl wait --for=condition=available \
+        /usr/local/bin/k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml wait \
+          --for=condition=available \
           deployment/minecraft -n minecraft --timeout=300s
       changed_when: false

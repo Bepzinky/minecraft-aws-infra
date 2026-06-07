@@ -15,9 +15,11 @@ spec:
       labels:
         app: minecraft
     spec:
+      imagePullSecrets:
+        - name: ecr-secret
       containers:
         - name: minecraft
-          image: 140132525527.dkr.ecr.us-east-1.amazonaws.com/mc-server-3:v1.0.1
+          image: 140132525527.dkr.ecr.us-east-1.amazonaws.com/mc-server-3:v1.0.2
           envFrom:
             - configMapRef:
                 name: minecraft-config
